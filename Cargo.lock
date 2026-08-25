@@ -834,6 +834,7 @@ dependencies = [
  "alloy-sol-types",
  "anyhow",
  "async-stream",
+ "async-trait",
  "axum",
  "bytes",
  "futures",
