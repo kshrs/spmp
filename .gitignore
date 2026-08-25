@@ -1,5 +1,6 @@
 # Research & Documentation
 research/
+tests/
 
 # Environment & Secrets
 .env
