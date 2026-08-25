@@ -7,6 +7,11 @@ tests/
 *.env
 .env.*
 
+# Rust & Cargo Build Artifacts
+target/
+**/*.rs.bk
+Cargo.lock.backup
+
 # Foundry & Smart Contract Artifacts
 cache/
 out/
@@ -14,7 +19,7 @@ broadcast/
 lib/
 remappings.txt
 
-# Go Binaries & Build Artifacts
+# Go Binaries & Build Artifacts (if used)
 bin/
 dist/
 *.exe
