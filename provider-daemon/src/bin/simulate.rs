@@ -2,7 +2,7 @@ use alloy_primitives::{keccak256, Address, B256};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolStruct;
-use provider_daemon::types::Ticket;
+use provider_daemon::types::{Ticket, SECP256K1_N};
 use provider_daemon::verifier::TicketVerifier;
 use std::env;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -17,6 +17,7 @@ async fn main() {
     let mut nonce = 1u64;
     let mut last_nonce = 0u64;
     let mut tamper_sig = false;
+    let mut malleable_s = false;
     let mut tamper_nonce = false;
     let mut tamper_commitment = false;
     let mut expired = false;
@@ -46,6 +47,7 @@ async fn main() {
                 i += 1;
             }
             "--tamper-sig" => tamper_sig = true,
+            "--malleable-s" => malleable_s = true,
             "--tamper-nonce" => tamper_nonce = true,
             "--tamper-commitment" => tamper_commitment = true,
             "--expired" => expired = true,
@@ -63,7 +65,8 @@ async fn main() {
                 println!("  --face-value <u128>      Face value in micro-units (default: 1000000)");
                 println!("  --nonce <u64>           Ticket sequence nonce (default: 1)");
                 println!("  --last-nonce <u64>      Verifier session watermark (default: 0)");
-                println!("  --tamper-sig            Inject corrupt signature bytes");
+                println!("  --tamper-sig            Inject corrupted signature bytes");
+                println!("  --malleable-s           Inject malleable high-s signature (EIP-2 attack vector)");
                 println!("  --tamper-nonce          Mutate nonce out-of-order");
                 println!("  --tamper-commitment     Mutate provider commitment");
                 println!("  --expired               Set ticket expiry in the past");
@@ -84,7 +87,7 @@ async fn main() {
     let contract_addr = Address::from([0x22; 20]);
     let chain_id = 31337u64;
 
-    let verifier = TicketVerifier::new(provider_addr, contract_addr, chain_id, provider_seed);
+    let mut verifier = TicketVerifier::new(provider_addr, contract_addr, chain_id, provider_seed);
     let client_signer = PrivateKeySigner::random();
     let client_addr = client_signer.address();
 
@@ -114,42 +117,56 @@ async fn main() {
     let signature = client_signer.sign_hash(&digest).await.unwrap();
     let mut sig_bytes = signature.as_bytes().to_vec();
 
-    if tamper_sig {
+    if malleable_s {
+        // Construct malleable high-s signature: s_high = N - s_low, flip v
+        let r = signature.r();
+        let s = signature.s();
+        let high_s = SECP256K1_N - s;
+        let v = signature.v();
+        let flipped_v = if v.y_parity() { 27 } else { 28 };
+
+        sig_bytes = [0u8; 65].to_vec();
+        sig_bytes[0..32].copy_from_slice(&r.to_be_bytes::<32>());
+        sig_bytes[32..64].copy_from_slice(&high_s.to_be_bytes::<32>());
+        sig_bytes[64] = flipped_v;
+    } else if tamper_sig {
         sig_bytes[10] ^= 0xFF; // Invalidate signature byte
     }
 
     println!("==========================================================================");
-    println!("  SPMP Fast Gatekeeper (Developer 2) Cryptographic Verification Sandbox   ");
+    println!("  SPMP Fast Gatekeeper (Developer 2) Hardened Cryptographic Sandbox       ");
     println!("==========================================================================");
     println!("Parameters:");
-    println!("  • Win Odds:             {}/{} ({:.4}%)", num, denom, (num as f64 / denom.max(1) as f64) * 100.0);
+    println!("  • Win Odds:             {}/{} ({:.4}%)", num, denom, if denom == 0 { 0.0 } else { (num as f64 / denom as f64) * 100.0 });
     println!("  • Client Signer:        {:?}", client_addr);
     println!("  • Provider Address:     {:?}", provider_addr);
     println!("  • Nonce:                {} (Watermark: {})", nonce, last_nonce);
     println!("  • Expiry:               {} (Expired: {})", expiry_ts, expired);
+    println!("  • Low-S Non-Malleable:  {}", !malleable_s);
     println!("  • Tamper Signature:     {}", tamper_sig);
     println!("  • Tamper Commitment:    {}", tamper_commitment);
     println!("  • Iterations:           {}", iterations);
     println!("--------------------------------------------------------------------------");
 
-    // Warm-up iteration to stabilize instruction cache
+    // Warm-up iteration to stabilize CPU cache
     for _ in 0..5 {
         let _ = verifier.verify_ticket(&ticket, &sig_bytes, client_addr, last_nonce);
     }
 
     // Timed benchmark loop
     let start = Instant::now();
-    let mut last_verdict = provider_daemon::types::TicketVerdict::InvalidNonce;
+    let mut last_decision = provider_daemon::types::GatekeeperDecision::Reject(provider_daemon::types::TicketVerdict::InvalidNonce);
     for _ in 0..iterations {
-        last_verdict = verifier.verify_ticket(&ticket, &sig_bytes, client_addr, last_nonce);
+        last_decision = verifier.evaluate_and_gate(&ticket, &sig_bytes, client_addr, last_nonce);
     }
     let elapsed = start.elapsed();
     let avg_micros = elapsed.as_micros() as f64 / iterations as f64;
 
     println!("Execution Outcome:");
-    println!("  • Ticket Verdict:       {:?}", last_verdict);
+    println!("  • Gatekeeper Decision:  {:?}", last_decision);
+    println!("  • Seed Invalidated:     {}", verifier.seed_invalidated);
     println!("  • Total Elapsed Time:   {:?}", elapsed);
     println!("  • Avg Latency / Ticket: {:.2} µs ({:.4} ms)", avg_micros, avg_micros / 1000.0);
-    println!("  • SLA Performance:      {}", if avg_micros < 500.0 { "PASSED (<0.5ms)" } else { "FAILED (>0.5ms)" });
+    println!("  • SLA Performance:      {}", if avg_micros <= 250.0 { "PASSED (<=0.25ms)" } else { "FAILED (>0.25ms)" });
     println!("==========================================================================");
 }

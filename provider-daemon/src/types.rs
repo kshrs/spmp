@@ -1,5 +1,16 @@
-﻿use alloy_sol_types::sol;
+﻿use alloy_primitives::{uint, U256};
+use alloy_sol_types::sol;
 use serde::{Deserialize, Serialize};
+
+/// Half-order of secp256k1 curve (n / 2) to protect against ECDSA signature malleability (EIP-2).
+pub const SECP256K1_HALF_ORDER: U256 = uint!(
+    0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E735EBE07597DA786400E927ED0_U256
+);
+
+/// Secp256k1 curve order n.
+pub const SECP256K1_N: U256 = uint!(
+    0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141_U256
+);
 
 // Core Solidity struct definition for exact EIP-712 hashing conformity
 sol! {
@@ -34,6 +45,17 @@ pub enum TicketVerdict {
     InvalidCommitment,
     InvalidNonce,
     Expired,
+}
+
+/// Discrete operational action returned to Developer 1 and Developer 3/4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GatekeeperDecision {
+    /// Ticket is valid losing. Serve compute chunk immediately.
+    ServeLosing,
+    /// Ticket is valid winning! Submit claim on-chain and trigger provider seed rotation.
+    ClaimAndRotateWinning,
+    /// Ticket was rejected. Terminate stream or halt connection.
+    Reject(TicketVerdict),
 }
 
 /// Wire protocol constants
