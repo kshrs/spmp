@@ -29,8 +29,10 @@
 use alloy_primitives::{keccak256, Address, B256};
 use anyhow::{anyhow, bail, Context};
 use rand::RngCore;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::types::{IncomingTicketFrame, MsgType, SessionConfig, SPMP_MAGIC};
@@ -38,6 +40,9 @@ use crate::types::{IncomingTicketFrame, MsgType, SessionConfig, SPMP_MAGIC};
 const TICKET_ABI_LEN: usize = 9 * 32; // Ticket has 9 static (non-dynamic) fields
 const CHANNEL_ID_LEN: usize = 32;
 const ADDRESS_LEN: usize = 20;
+
+const MAX_FRAME_SIZE: usize = 64 * 1024; // 64KB max payload size
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5); // 5s budget for init + ack
 
 pub struct TCPServer {
     listen_addr: String,
@@ -82,9 +87,7 @@ impl TCPServer {
             let provider_commitment = self.provider_commitment;
 
             tokio::spawn(async move {
-                if let Err(e) =
-                    Self::handle_client(&mut stream, provider_seed, provider_commitment).await
-                {
+                if let Err(e) = Self::handle_client(&mut stream, provider_seed, provider_commitment).await {
                     warn!(%peer, error = %e, "connection closed with error");
                 }
             });
@@ -117,6 +120,7 @@ impl TCPServer {
                         expected_next = session.last_nonce + 1,
                         "decoded ticket request"
                     );
+
                     // Watermark bump is provisional here — Dev 2's verifier
                     // is the actual source of truth on whether this nonce
                     // was valid; this just keeps `session` demonstrably wired.
@@ -142,19 +146,24 @@ impl TCPServer {
         provider_commitment: B256,
     ) -> anyhow::Result<SessionConfig> {
         let init_frame = Self::build_frame(MsgType::HandshakeInit, provider_commitment.as_slice());
-        stream
-            .write_all(&init_frame)
+
+        timeout(HANDSHAKE_TIMEOUT, stream.write_all(&init_frame))
             .await
+            .context("handshake write timed out")?
             .context("failed to send HandshakeInit")?;
 
-        let ack_buf = Self::read_frame(stream)
-            .await?
+        let ack_buf = timeout(HANDSHAKE_TIMEOUT, Self::read_frame(stream))
+            .await
+            .context("handshake read timed out")?
+            .context("failed to read HandshakeAck")?
             .ok_or_else(|| anyhow!("connection closed before HandshakeAck"))?;
 
         let (msg_type, payload) = Self::split_frame(&ack_buf)?;
+
         if msg_type != MsgType::HandshakeAck {
             bail!("expected HandshakeAck, got {msg_type:?}");
         }
+
         if payload.len() != CHANNEL_ID_LEN + ADDRESS_LEN {
             bail!(
                 "malformed HandshakeAck payload: expected {} bytes, got {}",
@@ -182,6 +191,7 @@ impl TCPServer {
     /// raw prompt payload bytes.
     pub fn decode_ticket_frame(buf: &[u8]) -> anyhow::Result<IncomingTicketFrame> {
         let (msg_type, payload) = Self::split_frame(buf)?;
+
         if msg_type != MsgType::TicketRequest {
             bail!("expected TicketRequest, got {msg_type:?}");
         }
@@ -196,14 +206,17 @@ impl TCPServer {
 
         let (sig_len_bytes, rest) = rest.split_at(4);
         let sig_len = u32::from_le_bytes(sig_len_bytes.try_into().unwrap()) as usize;
+
         if rest.len() < sig_len + 4 {
             bail!("ticket frame truncated: missing signature or payload_len");
         }
+
         let (sig_bytes, rest) = rest.split_at(sig_len);
         let signature = sig_bytes.to_vec();
 
         let (payload_len_bytes, rest) = rest.split_at(4);
         let payload_len = u32::from_le_bytes(payload_len_bytes.try_into().unwrap()) as usize;
+
         if rest.len() < payload_len {
             bail!(
                 "ticket frame declared payload_len={} but only {} bytes remain",
@@ -211,6 +224,7 @@ impl TCPServer {
                 rest.len()
             );
         }
+
         let prompt_payload = rest[..payload_len].to_vec();
 
         Ok(IncomingTicketFrame {
@@ -250,11 +264,13 @@ impl TCPServer {
         if buf.len() < 5 {
             bail!("frame too short to contain magic + type");
         }
+
         let (magic_bytes, rest) = buf.split_at(4);
         let magic = u32::from_be_bytes(magic_bytes.try_into().unwrap());
         if magic != SPMP_MAGIC {
             bail!("invalid SPMP_MAGIC: 0x{magic:08x}");
         }
+
         let msg_type = MsgType::from_u8(rest[0])?;
         Ok((msg_type, &rest[1..]))
     }
@@ -264,6 +280,7 @@ impl TCPServer {
     /// but not included), or `None` on clean EOF.
     async fn read_frame(stream: &mut TcpStream) -> anyhow::Result<Option<Vec<u8>>> {
         let mut header = [0u8; 9]; // 4 magic + 1 type + 4 len
+
         match stream.read_exact(&mut header).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -274,8 +291,17 @@ impl TCPServer {
         if magic != SPMP_MAGIC {
             bail!("invalid SPMP_MAGIC in frame header: 0x{magic:08x}");
         }
+
         let msg_type_byte = header[4];
         let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+
+        if len > MAX_FRAME_SIZE {
+            bail!(
+                "frame payload length ({} bytes) exceeds maximum allowed ({} bytes)",
+                len,
+                MAX_FRAME_SIZE
+            );
+        }
 
         let mut payload = vec![0u8; len];
         if len > 0 {
@@ -289,6 +315,7 @@ impl TCPServer {
         out.extend_from_slice(&header[0..4]);
         out.push(msg_type_byte);
         out.extend_from_slice(&payload);
+
         Ok(Some(out))
     }
 }
@@ -325,7 +352,6 @@ mod tests {
     async fn handshake_commitment_matches_keccak_of_seed_and_captures_session() {
         let listener = TestListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-
         let server = TCPServer::new(&addr.to_string());
         let expected_commitment = server.provider_commitment();
 
@@ -335,12 +361,13 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
-
         let mut header = [0u8; 9];
         client.read_exact(&mut header).await.unwrap();
+
         let magic = u32::from_be_bytes(header[0..4].try_into().unwrap());
         assert_eq!(magic, SPMP_MAGIC);
         assert_eq!(header[4], MsgType::HandshakeInit as u8);
+
         let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
         assert_eq!(len, 32);
 
@@ -374,6 +401,7 @@ mod tests {
         let magic = u32::from_be_bytes(frame[0..4].try_into().unwrap());
         assert_eq!(magic, SPMP_MAGIC);
         assert_eq!(frame[4], MsgType::ComputeResp as u8);
+
         let len = u32::from_le_bytes(frame[5..9].try_into().unwrap()) as usize;
         assert_eq!(len, 1 + "hello".len());
         assert_eq!(frame[9], 0u8);
