@@ -15,7 +15,7 @@ lib/
 remappings.txt
 
 # Go Binaries & Build Artifacts
-bin/
+/bin/
 dist/
 *.exe
 *.exe~

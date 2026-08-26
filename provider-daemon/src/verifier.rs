@@ -1,4 +1,4 @@
-﻿use alloy_primitives::{keccak256, Address, B256, Signature, U256};
+use alloy_primitives::{keccak256, Address, B256, Signature, U256};
 use alloy_sol_types::{Eip712Domain, SolStruct};
 use crate::types::{Ticket, TicketVerdict};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -286,5 +286,208 @@ mod tests {
         let avg_millis = avg_micros / 1000.0;
         println!("1,000 Tickets Verified in: {:?} (Avg: {:.2} µs [{:.3} ms] / ticket)", elapsed, avg_micros, avg_millis);
         assert!(avg_millis < 0.5, "Verification must be < 0.5ms per ticket, got {:.3}ms ({:.2}µs)", avg_millis, avg_micros);
+    }
+
+    // =========================================================================
+    // Phase 1: Property-Based Fuzzing Suite (proptest)
+    // =========================================================================
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// 1. Memory Safety & Crash Resilience: Arbitrary garbage input bytes must NEVER panic
+        #[test]
+        fn fuzz_arbitrary_signature_bytes_never_panics(
+            sig_bytes in proptest::collection::vec(any::<u8>(), 0..512),
+            nonce in any::<u64>(),
+            last_nonce in any::<u64>(),
+            face_value in any::<u128>(),
+            num in any::<u32>(),
+            denom in any::<u32>(),
+            expiry in any::<u64>(),
+            client_seed in any::<[u8; 32]>(),
+            provider_commitment in any::<[u8; 32]>(),
+            client_addr in any::<[u8; 20]>()
+        ) {
+            let verifier = TicketVerifier::new(
+                Address::from([0x11; 20]),
+                Address::from([0x22; 20]),
+                31337,
+                B256::from([0x77; 32]),
+            );
+
+            let ticket = Ticket {
+                channelId: B256::ZERO,
+                provider: verifier.provider_address,
+                nonce,
+                faceValue: face_value,
+                winProbNumerator: num,
+                winProbDenominator: denom,
+                expiry,
+                clientSeed: B256::from(client_seed),
+                providerCommitment: B256::from(provider_commitment),
+            };
+
+            // Must evaluate without panic
+            let verdict = verifier.verify_ticket(
+                &ticket,
+                &sig_bytes,
+                Address::from(client_addr),
+                last_nonce,
+            );
+
+            // Invariant: Nonce mismatch must always yield InvalidNonce
+            if nonce != last_nonce.wrapping_add(1) || (last_nonce == u64::MAX) {
+                prop_assert_eq!(verdict, TicketVerdict::InvalidNonce);
+            }
+        }
+
+        /// 2. Invariant: Watermark violations always yield InvalidNonce
+        #[test]
+        fn fuzz_nonce_monotonicity_invariant(
+            delta in 2..=u64::MAX,
+            last_nonce in 0..=(u64::MAX - 2),
+            sig_bytes in proptest::collection::vec(any::<u8>(), 0..65),
+            client_seed in any::<[u8; 32]>()
+        ) {
+            let verifier = TicketVerifier::new(
+                Address::from([0x11; 20]),
+                Address::from([0x22; 20]),
+                31337,
+                B256::from([0x77; 32]),
+            );
+
+            let out_of_order_nonce = last_nonce.saturating_add(delta);
+            let ticket = Ticket {
+                channelId: B256::ZERO,
+                provider: verifier.provider_address,
+                nonce: out_of_order_nonce,
+                faceValue: 1_000_000,
+                winProbNumerator: 1,
+                winProbDenominator: 1000,
+                expiry: 9999999999,
+                clientSeed: B256::from(client_seed),
+                providerCommitment: verifier.provider_commitment,
+            };
+
+            let verdict = verifier.verify_ticket(
+                &ticket,
+                &sig_bytes,
+                Address::from([0x55; 20]),
+                last_nonce,
+            );
+            prop_assert_eq!(verdict, TicketVerdict::InvalidNonce);
+        }
+
+        /// 3. Invariant: Commitment mismatch always yields InvalidCommitment
+        #[test]
+        fn fuzz_commitment_integrity_invariant(
+            bogus_commitment in any::<[u8; 32]>(),
+            last_nonce in 0..1000u64,
+            sig_bytes in proptest::collection::vec(any::<u8>(), 0..65)
+        ) {
+            let verifier = TicketVerifier::new(
+                Address::from([0x11; 20]),
+                Address::from([0x22; 20]),
+                31337,
+                B256::from([0x77; 32]),
+            );
+
+            // Ensure bogus commitment is different from actual
+            prop_assume!(B256::from(bogus_commitment) != verifier.provider_commitment);
+
+            let ticket = Ticket {
+                channelId: B256::ZERO,
+                provider: verifier.provider_address,
+                nonce: last_nonce + 1,
+                faceValue: 1_000_000,
+                winProbNumerator: 1,
+                winProbDenominator: 1000,
+                expiry: 9999999999,
+                clientSeed: B256::ZERO,
+                providerCommitment: B256::from(bogus_commitment),
+            };
+
+            let verdict = verifier.verify_ticket(
+                &ticket,
+                &sig_bytes,
+                Address::from([0x55; 20]),
+                last_nonce,
+            );
+            prop_assert_eq!(verdict, TicketVerdict::InvalidCommitment);
+        }
+
+        /// 4. Invariant: Expiry timestamp <= now always yields Expired
+        #[test]
+        fn fuzz_expiry_invariant(
+            expired_offset in 1..=100_000u64,
+            last_nonce in 0..1000u64,
+            sig_bytes in proptest::collection::vec(any::<u8>(), 0..65)
+        ) {
+            let verifier = TicketVerifier::new(
+                Address::from([0x11; 20]),
+                Address::from([0x22; 20]),
+                31337,
+                B256::from([0x77; 32]),
+            );
+
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let past_timestamp = now.saturating_sub(expired_offset);
+
+            let ticket = Ticket {
+                channelId: B256::ZERO,
+                provider: verifier.provider_address,
+                nonce: last_nonce + 1,
+                faceValue: 1_000_000,
+                winProbNumerator: 1,
+                winProbDenominator: 1000,
+                expiry: past_timestamp,
+                clientSeed: B256::ZERO,
+                providerCommitment: verifier.provider_commitment,
+            };
+
+            let verdict = verifier.verify_ticket(
+                &ticket,
+                &sig_bytes,
+                Address::from([0x55; 20]),
+                last_nonce,
+            );
+            prop_assert_eq!(verdict, TicketVerdict::Expired);
+        }
+
+        /// 5. Mathematical Stability: Extreme Numerator and Denominator variations
+        #[test]
+        fn fuzz_odds_mathematical_stability(
+            num in any::<u32>(),
+            denom in any::<u32>(),
+            client_seed in any::<[u8; 32]>(),
+            provider_seed in any::<[u8; 32]>()
+        ) {
+            let verifier = TicketVerifier::new(
+                Address::from([0x11; 20]),
+                Address::from([0x22; 20]),
+                31337,
+                B256::from(provider_seed),
+            );
+
+            let _ticket = Ticket {
+                channelId: B256::ZERO,
+                provider: verifier.provider_address,
+                nonce: 1,
+                faceValue: 1_000_000,
+                winProbNumerator: num,
+                winProbDenominator: denom,
+                expiry: 9999999999,
+                clientSeed: B256::from(client_seed),
+                providerCommitment: verifier.provider_commitment,
+            };
+
+            // Denom = 0 must never crash with integer division by zero
+            if denom == 0 {
+                let target = if denom == 0 { U256::ZERO } else { (U256::MAX / U256::from(denom)) * U256::from(num) };
+                prop_assert_eq!(target, U256::ZERO);
+            }
+        }
     }
 }

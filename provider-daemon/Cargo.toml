@@ -31,3 +31,4 @@ bytes = "1.6"
 
 [dev-dependencies]
 tokio-test = "0.4"
+proptest = "1.5"
