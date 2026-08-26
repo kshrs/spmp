@@ -1,14 +1,11 @@
 [package]
-name = "client-daemon"
+name = "provider-daemon"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Async Runtime & Web Framework
 tokio = { version = "1.37", features = ["full"] }
-axum = { version = "0.7", features = ["macros"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
-async-stream = "0.3"
+async-trait = "0.1"
 futures = "0.3"
 
 # Serialization & Web

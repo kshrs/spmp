@@ -38,3 +38,7 @@ yarn-error.log*
 .vscode/
 *.swp
 *~
+
+# Rust Cargo Artifacts
+target/
+Cargo.lock
