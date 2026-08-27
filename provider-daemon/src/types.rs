@@ -1,5 +1,6 @@
 use alloy_primitives::{Address, B256, U256};
-use alloy_sol_types::sol;
+use alloy_sol_types::{sol, SolValue};
+use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 
 // Solidity struct definition for exact EIP-712 hashing conformity with SPMPEscrow.sol
@@ -67,4 +68,22 @@ pub enum MsgType {
     ComputeResp = 0x04,
     WinNotify = 0x05,
     ErrorHalt = 0xFF,
+}
+
+impl MsgType {
+    pub fn from_u8(byte: u8) -> anyhow::Result<Self> {
+        match byte {
+            0x01 => Ok(Self::HandshakeInit),
+            0x02 => Ok(Self::HandshakeAck),
+            0x03 => Ok(Self::TicketRequest),
+            0x04 => Ok(Self::ComputeResp),
+            0x05 => Ok(Self::WinNotify),
+            0xFF => Ok(Self::ErrorHalt),
+            other => Err(anyhow!("unknown MsgType byte: 0x{other:02x}")),
+        }
+    }
+}
+
+pub fn decode_ticket(buf: &[u8]) -> anyhow::Result<Ticket> {
+    Ticket::abi_decode(buf, true).map_err(|e| anyhow!("bad Ticket abi: {e}"))
 }
