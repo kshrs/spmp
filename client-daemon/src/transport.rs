@@ -1,4 +1,3 @@
-// Developer 4 Module: Wire Protocol & TCP Client
 use alloy_primitives::B256;
 use anyhow::{anyhow, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,6 +19,10 @@ impl TCPClient {
             provider_addr,
             provider_commitment: Mutex::new(B256::ZERO),
         }
+    }
+
+    pub async fn get_provider_commitment(&self) -> B256 {
+        *self.provider_commitment.lock().await
     }
 
     pub fn encode_ticket_frame(ticket: &SignedTicket, payload: &[u8]) -> Vec<u8> {
@@ -101,10 +104,18 @@ impl TCPClient {
 
             stream.write_all(&buf).await?;
 
-            // Await the HandshakeAck (assuming it sends back the 32B Provider Commitment)
+            // 1. Read the 5-byte ack header: [Magic 4B] [MsgType 1B]
+            let mut ack_header = [0u8; 5];
+            stream.read_exact(&mut ack_header).await?;
+
+            if ack_header[4] != MsgType::HandshakeAck as u8 {
+                return Err(anyhow!("Expected HandshakeAck (0x02), got 0x{:02x}", ack_header[4]));
+            }
+
+            // 2. Read the 32-byte provider commitment
             let mut commitment_buf = [0u8; 32];
             stream.read_exact(&mut commitment_buf).await?;
-            
+
             let mut pc_guard = self.provider_commitment.lock().await;
             *pc_guard = B256::from_slice(&commitment_buf);
 
@@ -144,5 +155,44 @@ impl TCPClient {
         } else {
             Err(anyhow!("Cannot send frame: TCP stream not connected"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::TicketPayload;
+    use alloy_primitives::{address, b256, U256};
+
+    #[test]
+    fn test_encode_and_decode_frames() {
+        let ticket = SignedTicket {
+            payload: TicketPayload {
+                channel_id: b256!("1111111111111111111111111111111111111111111111111111111111111111"),
+                provider: address!("70997970C51812dc3A010C7d01b50e0d17dc79C8"),
+                nonce: 42,
+                face_value: U256::from(50_000),
+                win_prob_numerator: 1,
+                win_prob_denominator: 50,
+                expiry: 1700000000,
+                client_seed: b256!("2222222222222222222222222222222222222222222222222222222222222222"),
+                provider_commitment: b256!("3333333333333333333333333333333333333333333333333333333333333333"),
+            },
+            signature: vec![0u8; 65],
+        };
+
+        let encoded = TCPClient::encode_ticket_frame(&ticket, b"Hello SPMP");
+        assert!(encoded.len() > 176);
+        assert_eq!(&encoded[0..4], &SPMP_MAGIC.to_be_bytes());
+
+        // Test decode response frame
+        let mut mock_resp = vec![MsgType::ComputeResp as u8, 1u8]; // Done = true
+        let text_bytes = b"TokenOutput";
+        mock_resp.extend_from_slice(&(text_bytes.len() as u32).to_be_bytes());
+        mock_resp.extend_from_slice(text_bytes);
+
+        let (decoded_text, is_done) = TCPClient::decode_response_frame(&mock_resp).unwrap();
+        assert_eq!(decoded_text, "TokenOutput");
+        assert!(is_done);
     }
 }
