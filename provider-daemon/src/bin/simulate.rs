@@ -204,10 +204,8 @@ async fn run_variance_and_governor_audit(num: u32, denom: u32, face_value: u128,
         }
 
         // Sliding Window for Client Budget Governor (2 wins in <=50 tickets)
-        if sliding_window.len() == 50 {
-            if sliding_window.pop_front().unwrap() {
-                window_wins -= 1;
-            }
+        if sliding_window.len() == 50 && sliding_window.pop_front().unwrap() {
+            window_wins -= 1;
         }
         sliding_window.push_back(is_win);
         if is_win {
@@ -252,6 +250,7 @@ async fn run_variance_and_governor_audit(num: u32, denom: u32, face_value: u128,
     println!("===================================================================================");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_single_or_bench_mode(
     num: u32,
     denom: u32,
