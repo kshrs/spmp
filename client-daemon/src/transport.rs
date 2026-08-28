@@ -1,88 +1,106 @@
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
+use alloy_sol_types::SolValue; // <-- Added this import to bring abi_encode() into scope
 use anyhow::{anyhow, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
-use crate::types::{MsgType, SignedTicket, SPMP_MAGIC};
+use crate::types::{MsgType, SignedTicket, Ticket, SPMP_MAGIC};
 
 pub struct TCPClient {
-    stream: Mutex<Option<TcpStream>>,
+    stream: AsyncMutex<Option<TcpStream>>,
     provider_addr: String,
-    provider_commitment: Mutex<B256>,
+    provider_commitment: std::sync::Mutex<B256>,
 }
 
 impl TCPClient {
     pub fn new(provider_addr: String) -> Self {
         Self {
-            stream: Mutex::new(None),
+            stream: AsyncMutex::new(None),
             provider_addr,
-            provider_commitment: Mutex::new(B256::ZERO),
+            provider_commitment: std::sync::Mutex::new(B256::ZERO),
         }
     }
 
-    pub async fn get_provider_commitment(&self) -> B256 {
-        *self.provider_commitment.lock().await
+    pub fn get_provider_commitment(&self) -> B256 {
+        *self.provider_commitment.lock().unwrap()
     }
 
     pub fn encode_ticket_frame(ticket: &SignedTicket, payload: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::new();
+        // Construct the Alloy Solidity struct directly
+        let ticket_sol = Ticket {
+            channelId: ticket.payload.channel_id,
+            provider: ticket.payload.provider,
+            nonce: ticket.payload.nonce,
+            // Face value in Ticket is uint128, mapping to Rust u128
+            faceValue: ticket.payload.face_value.try_into().unwrap_or_default(),
+            winProbNumerator: ticket.payload.win_prob_numerator,
+            winProbDenominator: ticket.payload.win_prob_denominator,
+            expiry: ticket.payload.expiry,
+            clientSeed: ticket.payload.client_seed,
+            providerCommitment: ticket.payload.provider_commitment,
+        };
 
-        // [Magic 4B] | [MsgType 1B] | [Flags 1B] | [Reserved 2B]
-        buf.extend_from_slice(&SPMP_MAGIC.to_be_bytes()); 
-        buf.push(MsgType::TicketRequest as u8); // Uses 0x03 from types.rs
-        buf.push(0); // Flags
-        buf.extend_from_slice(&[0u8; 2]); // Reserved
+        // Leverage Alloy's built-in abi_encode() (Exactly 288 bytes)
+        let ticket_bytes = ticket_sol.abi_encode();
 
-        // [Nonce 8B] | [ChannelID 32B] | [ClientSeed 32B] | [ProviderCommitment 32B]
-        buf.extend_from_slice(&ticket.payload.nonce.to_be_bytes());
-        buf.extend_from_slice(ticket.payload.channel_id.as_slice());
-        buf.extend_from_slice(ticket.payload.client_seed.as_slice());
-        buf.extend_from_slice(ticket.payload.provider_commitment.as_slice());
+        let mut frame_payload = Vec::new();
+        frame_payload.extend_from_slice(&ticket_bytes);
 
-        // [FaceValue 16B] - Extract lower 16 bytes from U256
-        let face_value_bytes: [u8; 32] = ticket.payload.face_value.to_be_bytes();
-        buf.extend_from_slice(&face_value_bytes[16..32]);
+        // [u32_le sig_len] || [sig_bytes]
+        let sig_len = ticket.signature.len() as u32;
+        frame_payload.extend_from_slice(&sig_len.to_le_bytes());
+        frame_payload.extend_from_slice(&ticket.signature);
 
-        // [Num 4B] | [Denom 4B] | [Expiry 8B]
-        buf.extend_from_slice(&ticket.payload.win_prob_numerator.to_be_bytes());
-        buf.extend_from_slice(&ticket.payload.win_prob_denominator.to_be_bytes());
-        buf.extend_from_slice(&ticket.payload.expiry.to_be_bytes());
-
-        // [Sig R 32B] | [Sig S 32B] | [Sig V 1B]
-        if ticket.signature.len() == 65 {
-            buf.extend_from_slice(&ticket.signature);
-        } else {
-            buf.extend_from_slice(&[0u8; 65]);
-        }
-
-        // [PayloadLen 4B] | [PayloadData NB]
+        // [u32_le payload_len] || [prompt_bytes]
         let payload_len = payload.len() as u32;
-        buf.extend_from_slice(&payload_len.to_be_bytes());
-        buf.extend_from_slice(payload);
+        frame_payload.extend_from_slice(&payload_len.to_le_bytes());
+        frame_payload.extend_from_slice(payload);
+
+        // Compute total payload length for the 9-byte standard header
+        let total_payload_len = frame_payload.len() as u32;
+
+        let mut buf = Vec::new();
+        // 9-Byte Header: [Magic 4B BE] | [MsgType 1B] | [PayloadLen 4B LE]
+        buf.extend_from_slice(&SPMP_MAGIC.to_be_bytes()); 
+        buf.push(MsgType::TicketRequest as u8);
+        buf.extend_from_slice(&total_payload_len.to_le_bytes());
+        
+        // Append the encoded payload
+        buf.extend_from_slice(&frame_payload);
 
         buf
     }
 
     pub fn decode_response_frame(buf: &[u8]) -> Result<(String, bool)> {
-        // [MsgType 1B] [IsDone 1B] [PayloadLen 4B] [Payload NB]
-        if buf.len() < 6 {
+        // Minimum size: 9-Byte Header + [IsDone 1B]
+        if buf.len() < 10 {
             return Err(anyhow!("Response buffer too small to decode"));
         }
 
-        if buf[0] != MsgType::ComputeResp as u8 {
+        let magic = u32::from_be_bytes(buf[0..4].try_into()?);
+        if magic != SPMP_MAGIC {
+            return Err(anyhow!("Invalid magic bytes"));
+        }
+
+        if buf[4] != MsgType::ComputeResp as u8 {
             return Err(anyhow!("Unexpected message type received: expected ComputeResp"));
         }
 
-        let is_done = buf[1] != 0;
-        let len_bytes: [u8; 4] = buf[2..6].try_into()?;
-        let payload_len = u32::from_be_bytes(len_bytes) as usize;
-
-        if buf.len() < 6 + payload_len {
+        let payload_len = u32::from_le_bytes(buf[5..9].try_into()?) as usize;
+        
+        if buf.len() < 9 + payload_len {
             return Err(anyhow!("Incomplete payload received"));
         }
 
-        let text = String::from_utf8(buf[6..6 + payload_len].to_vec())?;
+        let payload_buf = &buf[9..9 + payload_len];
+        if payload_buf.is_empty() {
+            return Err(anyhow!("Compute response payload is empty"));
+        }
+
+        let is_done = payload_buf[0] != 0;
+        let text = String::from_utf8(payload_buf[1..].to_vec())?;
+        
         Ok((text, is_done))
     }
 
@@ -93,31 +111,44 @@ impl TCPClient {
         Ok(())
     }
 
-    pub async fn perform_handshake(&self, channel_id: B256) -> Result<()> {
+    pub async fn perform_handshake(&self, channel_id: B256, client_address: Address) -> Result<()> {
         let mut guard = self.stream.lock().await;
         if let Some(stream) = guard.as_mut() {
             
-            let mut buf = Vec::new();
-            buf.extend_from_slice(&SPMP_MAGIC.to_be_bytes());
-            buf.push(MsgType::HandshakeInit as u8); // Uses 0x01 from types.rs
-            buf.extend_from_slice(channel_id.as_slice());
+            // 1. Read Provider's HandshakeInit: [9-Byte Header] + [32B Commitment]
+            let mut header = [0u8; 9];
+            stream.read_exact(&mut header).await?;
 
-            stream.write_all(&buf).await?;
-
-            // 1. Read the 5-byte ack header: [Magic 4B] [MsgType 1B]
-            let mut ack_header = [0u8; 5];
-            stream.read_exact(&mut ack_header).await?;
-
-            if ack_header[4] != MsgType::HandshakeAck as u8 {
-                return Err(anyhow!("Expected HandshakeAck (0x02), got 0x{:02x}", ack_header[4]));
+            let magic = u32::from_be_bytes(header[0..4].try_into()?);
+            if magic != SPMP_MAGIC {
+                return Err(anyhow!("Handshake failed: Invalid magic bytes"));
             }
 
-            // 2. Read the 32-byte provider commitment
+            if header[4] != MsgType::HandshakeInit as u8 {
+                return Err(anyhow!("Expected HandshakeInit (0x01), got 0x{:02x}", header[4]));
+            }
+
             let mut commitment_buf = [0u8; 32];
             stream.read_exact(&mut commitment_buf).await?;
 
-            let mut pc_guard = self.provider_commitment.lock().await;
-            *pc_guard = B256::from_slice(&commitment_buf);
+            {
+                let mut pc_guard = self.provider_commitment.lock().unwrap();
+                *pc_guard = B256::from_slice(&commitment_buf);
+            }
+
+            // 2. Client responds with HandshakeAck
+            // Payload: [32B channel_id || 20B client_address]
+            let mut ack_payload = Vec::new();
+            ack_payload.extend_from_slice(channel_id.as_slice());
+            ack_payload.extend_from_slice(client_address.as_slice());
+
+            let mut ack_frame = Vec::new();
+            ack_frame.extend_from_slice(&SPMP_MAGIC.to_be_bytes()); // 4B BE
+            ack_frame.push(MsgType::HandshakeAck as u8); // 1B
+            ack_frame.extend_from_slice(&(ack_payload.len() as u32).to_le_bytes()); // 4B LE
+            ack_frame.extend_from_slice(&ack_payload);
+
+            stream.write_all(&ack_frame).await?;
 
             Ok(())
         } else {
@@ -136,27 +167,53 @@ impl TCPClient {
         if let Some(stream) = guard.as_mut() {
             stream.write_all(&frame).await?;
 
-            // Expecting [MsgType 1B] [IsDone 1B] [Len 4B]
-            let mut header = [0u8; 6];
+            // Read the 9-byte response header
+            let mut header = [0u8; 9];
             stream.read_exact(&mut header).await?;
             
-            if header[0] != MsgType::ComputeResp as u8 {
+            let magic = u32::from_be_bytes(header[0..4].try_into()?);
+            if magic != SPMP_MAGIC {
+                return Err(anyhow!("Response invalid: Invalid magic bytes"));
+            }
+
+            if header[4] != MsgType::ComputeResp as u8 {
                 return Err(anyhow!("Unexpected response message type"));
             }
 
-            let is_done = header[1] != 0;
-            let len = u32::from_be_bytes(header[2..6].try_into()?) as usize;
+            let len = u32::from_le_bytes(header[5..9].try_into()?) as usize;
             
             let mut payload = vec![0u8; len];
             stream.read_exact(&mut payload).await?;
             
-            let text = String::from_utf8(payload)?;
+            if payload.is_empty() {
+                return Err(anyhow!("Empty compute response payload"));
+            }
+
+            let is_done = payload[0] != 0;
+            let text = String::from_utf8(payload[1..].to_vec())?;
+            
             Ok((text, is_done))
         } else {
             Err(anyhow!("Cannot send frame: TCP stream not connected"))
         }
     }
 }
+
+// TODO: Uncomment once orchestrator module is merged (PR #4)
+// #[async_trait::async_trait]
+// impl crate::orchestrator::TransportTrait for TCPClient {
+//     fn get_provider_commitment(&self) -> B256 {
+//         self.get_provider_commitment()
+//     }
+// 
+//     async fn send_ticket_and_prompt(
+//         &self,
+//         ticket: &crate::types::SignedTicket,
+//         prompt_chunk: &str,
+//     ) -> anyhow::Result<(String, bool)> {
+//         self.send_ticket_and_prompt(ticket, prompt_chunk).await
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -182,13 +239,20 @@ mod tests {
         };
 
         let encoded = TCPClient::encode_ticket_frame(&ticket, b"Hello SPMP");
-        assert!(encoded.len() > 176);
+        // Verify 9-byte Header values
         assert_eq!(&encoded[0..4], &SPMP_MAGIC.to_be_bytes());
+        assert_eq!(encoded[4], MsgType::TicketRequest as u8);
 
         // Test decode response frame
-        let mut mock_resp = vec![MsgType::ComputeResp as u8, 1u8]; // Done = true
+        let mut mock_resp = Vec::new();
+        mock_resp.extend_from_slice(&SPMP_MAGIC.to_be_bytes());
+        mock_resp.push(MsgType::ComputeResp as u8);
+        
         let text_bytes = b"TokenOutput";
-        mock_resp.extend_from_slice(&(text_bytes.len() as u32).to_be_bytes());
+        let payload_len: u32 = 1 + text_bytes.len() as u32; 
+        mock_resp.extend_from_slice(&payload_len.to_le_bytes()); // 4B LE Length
+        
+        mock_resp.push(1u8); // IsDone = true
         mock_resp.extend_from_slice(text_bytes);
 
         let (decoded_text, is_done) = TCPClient::decode_response_frame(&mock_resp).unwrap();
