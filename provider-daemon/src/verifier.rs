@@ -476,6 +476,63 @@ mod tests {
         assert!(avg_millis < 0.25, "Verification must be < 0.25ms per ticket, got {:.3}ms ({:.2}µs)", avg_millis, avg_micros);
     }
 
+    #[tokio::test]
+    async fn test_dry_spell_and_binomial_variance() {
+        let (mut verifier, client_signer, client_addr, _provider_seed) = setup_env();
+        let mut rng = rand::thread_rng();
+        use rand::Rng;
+
+        let total_trials = 1000u64;
+        let mut wins = 0u64;
+        let mut current_dry_spell = 0u64;
+        let mut max_dry_spell = 0u64;
+
+        for nonce in 1..=total_trials {
+            let client_seed: [u8; 32] = rng.gen();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+            let ticket = Ticket {
+                channelId: B256::ZERO,
+                provider: verifier.provider_address,
+                nonce,
+                faceValue: 50_000,
+                winProbNumerator: 1,
+                winProbDenominator: 50,
+                expiry: now + 3600,
+                clientSeed: B256::from(client_seed),
+                providerCommitment: verifier.provider_commitment,
+            };
+
+            let digest = ticket.eip712_signing_hash(&verifier.domain);
+            let sig = client_signer.sign_hash(&digest).await.unwrap();
+
+            let decision = verifier.evaluate_and_gate(&ticket, &sig.as_bytes(), client_addr, nonce - 1);
+            match decision {
+                GatekeeperDecision::ClaimAndRotateWinning => {
+                    wins += 1;
+                    current_dry_spell = 0;
+                    let new_seed: [u8; 32] = rng.gen();
+                    verifier.rotate_seed(B256::from(new_seed));
+                }
+                GatekeeperDecision::ServeLosing => {
+                    current_dry_spell += 1;
+                    if current_dry_spell > max_dry_spell {
+                        max_dry_spell = current_dry_spell;
+                    }
+                }
+                GatekeeperDecision::Reject(err) => {
+                    panic!("Unexpected rejection in variance test at nonce {}: {:?}", nonce, err);
+                }
+            }
+        }
+
+        println!("1,000-Trial Test: {} Wins, Longest Dry Spell: {} consecutive losses", wins, max_dry_spell);
+        // Over 1,000 trials at p=0.02, probability of 0 wins is (0.98)^1000 ≈ 1.68e-9.
+        // It is mathematically virtually impossible to have 0 wins.
+        assert!(wins > 0, "Must have at least one winning ticket in 1,000 trials (p=0.02)");
+        assert!(max_dry_spell < 1000, "Max dry spell cannot exceed total trials");
+    }
+
     // =========================================================================
     // Phase 1: Property-Based Fuzzing Suite (proptest)
     // =========================================================================
