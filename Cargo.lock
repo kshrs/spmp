@@ -2621,6 +2621,7 @@ dependencies = [
  "alloy-sol-types",
  "alloy-transport-http",
  "anyhow",
+ "async-trait",
  "axum",
  "bytes",
  "futures",
