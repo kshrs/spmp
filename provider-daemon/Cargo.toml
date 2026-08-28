@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "provider-daemon"
 version = "0.1.0"
 edition = "2021"
@@ -9,6 +9,7 @@ tokio = { version = "1.37", features = ["full"] }
 axum = { version = "0.7", features = ["macros"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
+async-trait = "0.1"
 futures = "0.3"
 
 # Serialization & JSON
@@ -36,7 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
 anyhow = "1.0"
 bytes = "1.6"
-async-trait = "0.1.92"
 
 [dev-dependencies]
 tokio-test = "0.4"
+proptest = "1.5"

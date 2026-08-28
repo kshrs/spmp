@@ -19,8 +19,8 @@ broadcast/
 lib/
 remappings.txt
 
-# Go Binaries & Build Artifacts (if used)
-bin/
+# Go Binaries & Build Artifacts
+/bin/
 dist/
 *.exe
 *.exe~
@@ -43,3 +43,7 @@ yarn-error.log*
 .vscode/
 *.swp
 *~
+
+# Rust Cargo Artifacts
+target/
+Cargo.lock

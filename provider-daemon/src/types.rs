@@ -1,11 +1,21 @@
-use alloy_primitives::{Address, B256, U256};
+﻿use alloy_primitives::{uint, Address, B256, U256};
 use alloy_sol_types::{sol, SolValue};
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 
-// Solidity struct definition for exact EIP-712 hashing conformity with SPMPEscrow.sol
+/// Half-order of secp256k1 curve (n / 2) to protect against ECDSA signature malleability (EIP-2).
+pub const SECP256K1_HALF_ORDER: U256 = uint!(
+    0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E735EBE07597DA786400E927ED0_U256
+);
+
+/// Secp256k1 curve order n.
+pub const SECP256K1_N: U256 = uint!(
+    0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141_U256
+);
+
+// Core Solidity struct definition for exact EIP-712 hashing conformity with SPMPEscrow.sol
 sol! {
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct Ticket {
         bytes32 channelId;
         address provider;
@@ -46,8 +56,8 @@ pub struct IncomingTicketFrame {
     pub prompt_payload: Vec<u8>,
 }
 
-/// Evaluation verdict computed in-memory by Dev 2's Gatekeeper.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Verification verdict returned by Developer 2's Fast Gatekeeper engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TicketVerdict {
     ValidLosing,
     ValidWinning,
@@ -57,6 +67,18 @@ pub enum TicketVerdict {
     Expired,
 }
 
+/// Discrete operational action returned to Developer 1 and Developer 3/4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GatekeeperDecision {
+    /// Ticket is valid losing. Serve compute chunk immediately.
+    ServeLosing,
+    /// Ticket is valid winning! Submit claim on-chain and trigger provider seed rotation.
+    ClaimAndRotateWinning,
+    /// Ticket was rejected. Terminate stream or halt connection.
+    Reject(TicketVerdict),
+}
+
+/// Wire protocol constants
 pub const SPMP_MAGIC: u32 = 0x53504D50; // "SPMP" in ASCII
 
 #[repr(u8)]
