@@ -1,5 +1,6 @@
 [workspace]
 members = [
     "client-daemon",
+    "provider-daemon",
 ]
 resolver = "2"
