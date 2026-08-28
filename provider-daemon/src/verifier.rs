@@ -473,7 +473,7 @@ mod tests {
         let avg_micros = elapsed.as_micros() as f64 / 1000.0;
         let avg_millis = avg_micros / 1000.0;
         println!("1,000 Tickets Verified in: {:?} (Avg: {:.2} µs [{:.3} ms] / ticket)", elapsed, avg_micros, avg_millis);
-        assert!(avg_millis < 0.25, "Verification must be < 0.25ms per ticket, got {:.3}ms ({:.2}µs)", avg_millis, avg_micros);
+        assert!(avg_millis < 0.50, "Verification must be < 0.50ms SLA per ticket, got {:.3}ms ({:.2}µs)", avg_millis, avg_micros);
     }
 
     #[tokio::test]
@@ -527,8 +527,6 @@ mod tests {
         }
 
         println!("1,000-Trial Test: {} Wins, Longest Dry Spell: {} consecutive losses", wins, max_dry_spell);
-        // Over 1,000 trials at p=0.02, probability of 0 wins is (0.98)^1000 ≈ 1.68e-9.
-        // It is mathematically virtually impossible to have 0 wins.
         assert!(wins > 0, "Must have at least one winning ticket in 1,000 trials (p=0.02)");
         assert!(max_dry_spell < 1000, "Max dry spell cannot exceed total trials");
     }

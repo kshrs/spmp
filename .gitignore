@@ -7,6 +7,11 @@ tests/
 *.env
 .env.*
 
+# Rust & Cargo Build Artifacts
+target/
+**/*.rs.bk
+Cargo.lock.backup
+
 # Foundry & Smart Contract Artifacts
 cache/
 out/
