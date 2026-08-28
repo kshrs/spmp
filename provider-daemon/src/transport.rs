@@ -751,4 +751,271 @@ mod tests {
         let server_res = server_task.await.unwrap();
         assert!(server_res.is_err());
     }
+
+    // =========================================================================
+    // Red-Team Adversarial Audit & Edge Case Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_adversarial_oversized_payload_attack_mitigation() {
+        let listener = TestListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = TCPServer::new(&addr.to_string());
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = server.handle_handshake(&mut stream).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // 1. Read server's HandshakeInit
+        let mut init_header = [0u8; 9];
+        client.read_exact(&mut init_header).await.unwrap();
+        let init_len = u32::from_le_bytes(init_header[5..9].try_into().unwrap()) as usize;
+        let mut init_buf = vec![0u8; init_len];
+        client.read_exact(&mut init_buf).await.unwrap();
+
+        // 2. Send oversized HandshakeAck with declared len = 100_000 (> MAX_FRAME_SIZE 64KB)
+        let mut evil_header = [0u8; 9];
+        evil_header[0..4].copy_from_slice(&SPMP_MAGIC.to_be_bytes());
+        evil_header[4] = MsgType::HandshakeAck as u8;
+        evil_header[5..9].copy_from_slice(&100_000u32.to_le_bytes()); // Declared 100KB
+
+        client.write_all(&evil_header).await.unwrap();
+
+        // Server must drop connection without allocating 100KB (OOM prevention)
+        let mut check_buf = [0u8; 1];
+        let is_closed = matches!(client.read(&mut check_buf).await, Ok(0) | Err(_));
+        assert!(is_closed, "Server must close connection on oversized payload attack");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_adversarial_invalid_magic_bytes_mitigation() {
+        let listener = TestListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = TCPServer::new(&addr.to_string());
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = server.handle_handshake(&mut stream).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // Send corrupted magic bytes (0xDEADBEEF instead of SPMP)
+        let mut corrupt_frame = Vec::new();
+        corrupt_frame.extend_from_slice(&0xDEADBEEFu32.to_be_bytes());
+        corrupt_frame.push(MsgType::HandshakeAck as u8);
+        corrupt_frame.extend_from_slice(&32u32.to_le_bytes());
+        corrupt_frame.extend_from_slice(&[0xFF; 32]);
+
+        client.write_all(&corrupt_frame).await.unwrap();
+
+        // Server must reject instantly and drop connection
+        let mut check_buf = [0u8; 1];
+        let is_closed = matches!(client.read(&mut check_buf).await, Ok(0) | Err(_));
+        assert!(is_closed, "Server must close connection on corrupted magic bytes");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_adversarial_cryptographic_forgery_mitigation() {
+        let listener = TestListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let provider_addr = Address::from([0x11; 20]);
+        let contract_addr = Address::from([0x22; 20]);
+        let chain_id = 31337u64;
+
+        let server = TCPServer::new(&addr.to_string())
+            .with_chain_config(provider_addr, contract_addr, chain_id);
+
+        let provider_seed = server.provider_seed;
+        let provider_commitment = server.provider_commitment;
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            TCPServer::handle_client(
+                &mut stream,
+                provider_addr,
+                contract_addr,
+                chain_id,
+                provider_seed,
+                provider_commitment,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let client_signer = PrivateKeySigner::random();
+        let client_addr = client_signer.address();
+        let channel_id = keccak256([client_addr.as_slice(), provider_addr.as_slice()].concat());
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // Handshake
+        let mut header = [0u8; 9];
+        client.read_exact(&mut header).await.unwrap();
+        let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+        let mut commitment_buf = vec![0u8; len];
+        client.read_exact(&mut commitment_buf).await.unwrap();
+        let received_commitment = B256::from_slice(&commitment_buf);
+
+        let mut ack_payload = Vec::with_capacity(52);
+        ack_payload.extend_from_slice(channel_id.as_slice());
+        ack_payload.extend_from_slice(client_addr.as_slice());
+        let ack_frame = TCPServer::build_frame(MsgType::HandshakeAck, &ack_payload);
+        client.write_all(&ack_frame).await.unwrap();
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+        // Structurally valid ticket with FORGED 65-byte signature
+        let ticket = Ticket {
+            channelId: channel_id,
+            provider: provider_addr,
+            nonce: 1,
+            faceValue: 50_000,
+            winProbNumerator: 1,
+            winProbDenominator: 1000,
+            expiry: now + 3600,
+            clientSeed: B256::from([0xAA; 32]),
+            providerCommitment: received_commitment,
+        };
+
+        let forged_signature = [0xEEu8; 65]; // Bogus signature
+
+        let mut ticket_payload = Vec::new();
+        ticket_payload.extend_from_slice(&ticket.abi_encode());
+        ticket_payload.extend_from_slice(&(forged_signature.len() as u32).to_le_bytes());
+        ticket_payload.extend_from_slice(&forged_signature);
+        let prompt_bytes = b"Forged Signature Attack";
+        ticket_payload.extend_from_slice(&(prompt_bytes.len() as u32).to_le_bytes());
+        ticket_payload.extend_from_slice(prompt_bytes);
+
+        let req_frame = TCPServer::build_frame(MsgType::TicketRequest, &ticket_payload);
+        client.write_all(&req_frame).await.unwrap();
+
+        // Gatekeeper must catch forged signature and send ErrorHalt
+        let mut err_header = [0u8; 9];
+        client.read_exact(&mut err_header).await.unwrap();
+        assert_eq!(err_header[4], MsgType::ErrorHalt as u8);
+
+        let err_len = u32::from_le_bytes(err_header[5..9].try_into().unwrap()) as usize;
+        let mut err_body = vec![0u8; err_len];
+        client.read_exact(&mut err_body).await.unwrap();
+        let err_str = String::from_utf8_lossy(&err_body);
+        assert!(err_str.contains("InvalidSignature"));
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_adversarial_replay_attack_mitigation() {
+        let listener = TestListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let provider_addr = Address::from([0x11; 20]);
+        let contract_addr = Address::from([0x22; 20]);
+        let chain_id = 31337u64;
+
+        let server = TCPServer::new(&addr.to_string())
+            .with_chain_config(provider_addr, contract_addr, chain_id);
+
+        let provider_seed = server.provider_seed;
+        let provider_commitment = server.provider_commitment;
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            TCPServer::handle_client(
+                &mut stream,
+                provider_addr,
+                contract_addr,
+                chain_id,
+                provider_seed,
+                provider_commitment,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let client_signer = PrivateKeySigner::random();
+        let client_addr = client_signer.address();
+        let channel_id = keccak256([client_addr.as_slice(), provider_addr.as_slice()].concat());
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // Handshake
+        let mut header = [0u8; 9];
+        client.read_exact(&mut header).await.unwrap();
+        let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+        let mut commitment_buf = vec![0u8; len];
+        client.read_exact(&mut commitment_buf).await.unwrap();
+        let received_commitment = B256::from_slice(&commitment_buf);
+
+        let mut ack_payload = Vec::with_capacity(52);
+        ack_payload.extend_from_slice(channel_id.as_slice());
+        ack_payload.extend_from_slice(client_addr.as_slice());
+        let ack_frame = TCPServer::build_frame(MsgType::HandshakeAck, &ack_payload);
+        client.write_all(&ack_frame).await.unwrap();
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+        // 1. Send Valid Initial Ticket (nonce = 1)
+        let valid_ticket = Ticket {
+            channelId: channel_id,
+            provider: provider_addr,
+            nonce: 1,
+            faceValue: 50_000,
+            winProbNumerator: 0, // Losing ticket
+            winProbDenominator: 1000,
+            expiry: now + 3600,
+            clientSeed: B256::from([0x11; 32]),
+            providerCommitment: received_commitment,
+        };
+
+        let verifier = TicketVerifier::new(provider_addr, contract_addr, chain_id, provider_seed);
+        let digest = valid_ticket.eip712_signing_hash(&verifier.domain);
+        let sig = client_signer.sign_hash(&digest).await.unwrap();
+
+        let mut ticket_payload = Vec::new();
+        ticket_payload.extend_from_slice(&valid_ticket.abi_encode());
+        ticket_payload.extend_from_slice(&(sig.as_bytes().len() as u32).to_le_bytes());
+        ticket_payload.extend_from_slice(sig.as_bytes().as_ref());
+        let prompt_bytes = b"Initial Prompt";
+        ticket_payload.extend_from_slice(&(prompt_bytes.len() as u32).to_le_bytes());
+        ticket_payload.extend_from_slice(prompt_bytes);
+
+        let req_frame = TCPServer::build_frame(MsgType::TicketRequest, &ticket_payload);
+        client.write_all(&req_frame).await.unwrap();
+
+        // Read initial ComputeResp
+        let mut resp_header = [0u8; 9];
+        client.read_exact(&mut resp_header).await.unwrap();
+        assert_eq!(resp_header[4], MsgType::ComputeResp as u8);
+        let resp_len = u32::from_le_bytes(resp_header[5..9].try_into().unwrap()) as usize;
+        let mut resp_body = vec![0u8; resp_len];
+        client.read_exact(&mut resp_body).await.unwrap();
+
+        // 2. REPLAY ATTACK: Send the EXACT same frame again (replaying nonce 1)
+        client.write_all(&req_frame).await.unwrap();
+
+        // Gatekeeper must detect repeated nonce and reject immediately with ErrorHalt
+        let mut err_header = [0u8; 9];
+        client.read_exact(&mut err_header).await.unwrap();
+        assert_eq!(err_header[4], MsgType::ErrorHalt as u8);
+
+        let err_len = u32::from_le_bytes(err_header[5..9].try_into().unwrap()) as usize;
+        let mut err_body = vec![0u8; err_len];
+        client.read_exact(&mut err_body).await.unwrap();
+        let err_str = String::from_utf8_lossy(&err_body);
+        assert!(err_str.contains("InvalidNonce"), "Replayed ticket must be rejected with InvalidNonce");
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_err());
+    }
 }
