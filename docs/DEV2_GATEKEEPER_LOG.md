@@ -1,4 +1,4 @@
-﻿# Developer 2: Fast Gatekeeper & Cryptographic Engine Log
+# Developer 2: Fast Gatekeeper & Cryptographic Engine Log
 
 This document serves as the formal technical handoff and architecture record for **Developer 2 (Fast Gatekeeper)** within the SPMP Provider Daemon workspace.
 
@@ -183,3 +183,51 @@ match verifier.evaluate_and_gate(&incoming_frame.ticket, &incoming_frame.sig, cl
   ```bash
   cargo run --bin simulate --release -- --malleable-s
   ```
+
+---
+
+## 7. TCP Orchestrator Live Integration (`src/transport.rs`)
+
+Developer 2's `TicketVerifier` is directly integrated into Developer 1's `TCPServer::handle_client` connection loop:
+
+```
+                  ┌─────────────────────────────────────┐
+                  │ Inbound TCP Stream (0.0.0.0:9000)   │
+                  └──────────────────┬──────────────────┘
+                                     │
+                     1. HandshakeInit / HandshakeAck
+                                     │
+                                     ▼
+                      Instantiate TicketVerifier
+                    (provider_seed, domain, rules)
+                                     │
+                                     ▼
+                      Read Frame & ABI-Decode Ticket
+                                     │
+                                     ▼
+                ┌─────────────────────────────────────────┐
+                │ verifier.evaluate_and_gate(&ticket,     │
+                │     &sig, client_addr, last_nonce)      │
+                └────────────────────┬────────────────────┘
+                                     │
+        ┌────────────────────────────┼────────────────────────────┐
+        │                            │                            │
+        ▼                            ▼                            ▼
+[ GatekeeperDecision ]      [ GatekeeperDecision ]      [ GatekeeperDecision ]
+  ServeLosing                 ClaimAndRotateWinning       Reject(verdict)
+        │                            │                            │
+• Bump last_nonce           • Bump last_nonce           • Log warning
+• Forward prompt to         • Dispatch ClaimTask to     • Send MsgType::ErrorHalt
+  LLM Worker backend          SettlementWorker queue    • Terminate TCP connection
+• Stream ComputeResp        • Rotate CSPRNG seed
+                              H(rP_new) atomically
+                            • Stream ComputeResp
+```
+
+### Zero-Allocation Slice Handoff
+Incoming frames decoded off the wire slice signature bytes (`&incoming.signature`) and ABI ticket references directly into `TicketVerifier::evaluate_and_gate` without intermediate heap cloning or memory allocations on the hot path.
+
+### Test Coverage
+- `test_tcp_gatekeeper_integration_serve_losing_and_claim_winning`: Validates complete live handshake, losing ticket computation chunk streaming, winning ticket detection, on-chain settlement dispatch (`ClaimTask`), and atomic seed rotation.
+- `test_tcp_gatekeeper_integration_reject_invalid_nonce`: Validates immediate `MsgType::ErrorHalt` response and stream termination upon sequence violation.
+
